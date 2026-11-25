@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
+from app.ownership import ownership_guard
 from app.services import service_for
 
 router = APIRouter(prefix="/api/chains", tags=["业务链路"])
@@ -62,7 +63,11 @@ def chain_stream_ingest(source_id: int, ingest_id: int, commit_id: int) -> dict:
 
 @router.post("/storage-optimize")
 def chain_storage_optimize(table_id: int, merge_id: int, compaction_id: int) -> dict:
-    """存储优化链路：定义湖表 → 合并分区 → 规划压缩 → 压缩表。"""
+    """存储优化链路：定义湖表 → 合并分区 → 规划压缩 → 压缩表。
+
+    合并与压缩入口共享目标表文件归属清单；目标湖表不属于本次定义的物理表时
+    拒绝越权，不再把不同湖表的分区/文件当成一次成功存储优化。
+    """
     steps = []
 
     # Step 1: 定义湖表
@@ -73,20 +78,53 @@ def chain_storage_optimize(table_id: int, merge_id: int, compaction_id: int) -> 
     steps.append({"step": "define_table", "ok": r1["ok"], "details": r1})
     if not r1["ok"]:
         return {"chain": "storage-optimize", "ok": False, "steps": steps, "error": r1.get("message")}
+    table_identity = r1.get("table_id")  # 物理表身份（表标识），同名表按物理表区分
 
-    # Step 2: 合并分区
+    # Step 2: 合并分区（校验合并任务目标湖表与定义湖表同属一张物理表）
     svc_merge = service_for("partition_merge")
     if not svc_merge:
         raise HTTPException(404, "partition_merge 服务未注册")
+    merge_entry = svc_merge.get_entry(merge_id)
+    if merge_entry is None:
+        detail = {"ok": False, "message": f"合并任务 {merge_id} 不存在"}
+        steps.append({"step": "merge_partitions", "ok": False, "details": detail})
+        return {"chain": "storage-optimize", "ok": False, "steps": steps, "error": detail["message"]}
+    merge_owner = ownership_guard.resolve_table(merge_entry.get("目标湖表"))
+    if merge_owner != table_identity:
+        detail = {
+            "ok": False,
+            "message": (
+                f"合并任务目标湖表「{merge_entry.get('目标湖表')}」不属于本次定义的"
+                f"湖表「{r1.get('table_name')}」，拒绝越权合并"
+            ),
+        }
+        steps.append({"step": "merge_partitions", "ok": False, "details": detail})
+        return {"chain": "storage-optimize", "ok": False, "steps": steps, "error": detail["message"]}
     r2 = svc_merge.domain_merge_partitions(merge_id)
     steps.append({"step": "merge_partitions", "ok": r2["ok"], "details": r2})
     if not r2["ok"]:
         return {"chain": "storage-optimize", "ok": False, "steps": steps, "error": r2.get("message")}
 
-    # Step 3: 规划压缩
+    # Step 3: 规划压缩（同样校验目标湖表归属）
     svc_comp = service_for("compaction_task")
     if not svc_comp:
         raise HTTPException(404, "compaction_task 服务未注册")
+    comp_entry = svc_comp.get_entry(compaction_id)
+    if comp_entry is None:
+        detail = {"ok": False, "message": f"压缩任务 {compaction_id} 不存在"}
+        steps.append({"step": "plan_compaction", "ok": False, "details": detail})
+        return {"chain": "storage-optimize", "ok": False, "steps": steps, "error": detail["message"]}
+    comp_owner = ownership_guard.resolve_table(comp_entry.get("目标湖表"))
+    if comp_owner != table_identity:
+        detail = {
+            "ok": False,
+            "message": (
+                f"压缩任务目标湖表「{comp_entry.get('目标湖表')}」不属于本次定义的"
+                f"湖表「{r1.get('table_name')}」，拒绝越权压缩"
+            ),
+        }
+        steps.append({"step": "plan_compaction", "ok": False, "details": detail})
+        return {"chain": "storage-optimize", "ok": False, "steps": steps, "error": detail["message"]}
     r3 = svc_comp.domain_plan_compaction(compaction_id)
     steps.append({"step": "plan_compaction", "ok": r3["ok"], "details": r3})
     if not r3["ok"]:
@@ -95,12 +133,16 @@ def chain_storage_optimize(table_id: int, merge_id: int, compaction_id: int) -> 
     # Step 4: 压缩表
     r4 = svc_comp.domain_compact_table(compaction_id)
     steps.append({"step": "compact_table", "ok": r4["ok"], "details": r4})
+    if not r4["ok"]:
+        return {"chain": "storage-optimize", "ok": False, "steps": steps, "error": r4.get("message")}
 
     return {"chain": "storage-optimize", "ok": True, "steps": steps, "summary": {
         "table_def": r1.get("ddl"),
         "merged_files": r2.get("merged_files"),
         "compaction_plan": r3.get("plan"),
         "compression_ratio": r4.get("compression_ratio"),
+        "merge_manifest": r2.get("manifest_id"),
+        "compaction_manifest": r3.get("manifest_id"),
     }}
 
 

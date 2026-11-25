@@ -16,6 +16,8 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/ownership.py 归属治理接口（归属清单/复核清单/计划提交/目录事件）
+│   ├── app/ownership.py      湖表归属守卫：表目录、目标表文件归属清单、幂等提交
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
@@ -76,6 +78,19 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 归属守卫（分区合并 / 压缩任务）
+
+- 分区合并与压缩任务各入口共享 `app/ownership.py` 生成的同一份**目标表文件归属清单**，
+  提交前校验湖表写入权限和共享归属，越权（未登记/已冻结/跨表混用）一律拒绝。
+- 归属冲突支持两种处置边界：`abort` 整项中止（本计划没有重写）、`isolate`
+  逐文件隔离（只处理仍能证明属于原表的文件）；冲突结果回写**合并复核清单**。
+- 同名文件和分区按物理表区分；同一计划只生效一次，并发提交也只执行一次实际写入；
+  处理优先级决定冲突文件归属生效方；中断恢复保留原表身份，不把旧别名解释成新湖表。
+- 治理接口：`GET /api/ownership/manifests/{表}`（归属清单）、
+  `GET /api/ownership/tables/{表}/detail`（重写清单/冲突待办/写入次数）、
+  `GET /api/ownership/review-list`（合并复核清单）、
+  `POST /api/ownership/plans[/…/commit]`（计划准备/提交）及 `/catalog/*` 目录事件。
 
 领域：数据工程
 子方向：数仓与数据湖

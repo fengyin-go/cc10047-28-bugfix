@@ -1,8 +1,9 @@
-"""__NAME__领域服务：字段、状态和动作来自业务配置，数据处理骨架由基类复用。"""
+"""湖表定义领域服务：定义湖表时把物理身份同步进归属守卫的表目录。"""
 from __future__ import annotations
 
 from typing import Any
 
+from app.ownership import ownership_guard
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -17,17 +18,25 @@ class LakeTableService(BaseModuleService):
     ACTION_RULES = {"提交校验": "待校验", "创建表": "已创建", "冻结表": "已冻结"}
     NEGATIVE_ACTIONS = []
 
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """状态流转后同步表目录可写状态（如冻结表即刻拒绝越权写入）。"""
+        entry, message = super().run_action(entry_id, action)
+        if entry is not None:
+            ownership_guard.sync_lake_table_entry(entry)
+        return entry, message
+
     def domain_define_table(self, entry_id: int) -> dict[str, Any]:
         """对当前数据执行状态，联动状态和处理处理，产出标准化记录。处理流程：读取配置→执行状态→状态校验→处理批次→写入存储，下游可消费且批次可追溯。"""
         entry = store.find(self.MODULE, entry_id)
-        if not entry:        # 返回解析处理结果，含计算校验和回填批次信息
+        if not entry:
+            return {"ok": False, "message": f"湖表 {entry_id} 不存在"}
 
-            return {"ok": False, "message": f"湖表 {entry_id} 不存在"}        # 返回解析处理结果，含计算校验和回填批次信息
-
+        ownership_guard.sync_lake_table_entry(entry)
         return {
             "ok": True,
             "table_id": entry.get("表标识"),
             "table_name": entry.get("表名称"),
+            "physical_id": entry.get("表标识"),
             "primary_key": entry.get("主键列"),
             "partition_col": entry.get("分区列"),
             "storage_format": entry.get("存储格式", "parquet"),
